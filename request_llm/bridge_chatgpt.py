@@ -18,15 +18,19 @@ import logging
 import traceback
 import requests
 import importlib
+from mongo_history import MongoHistory
 
 # config_private.py放自己的秘密如API和代理网址
 # 读取时首先看是否存在私密的config_private配置文件（不受git管控），如果有，则覆盖原config文件
-from toolbox import get_conf, update_ui, is_any_api_key, select_api_key, what_keys, clip_history, trimmed_format_exc
+from toolbox import get_conf, update_ui, is_any_api_key, select_api_key, what_keys, clip_history, trimmed_format_exc, \
+    with_search_results
+
 proxies, API_KEY, TIMEOUT_SECONDS, MAX_RETRY = \
     get_conf('proxies', 'API_KEY', 'TIMEOUT_SECONDS', 'MAX_RETRY')
 
 timeout_bot_msg = '[Local Message] Request timeout. Network error. Please check proxy settings in config.py.' + \
                   '网络错误，检查代理服务器是否可用，以及代理设置的格式是否正确，格式须是[协议]://[地址]:[端口]，缺一不可。'
+mongodb_history = MongoHistory()
 
 def get_full_error(chunk, stream_response):
     """
@@ -74,12 +78,12 @@ def predict_no_ui_long_connection(inputs, llm_kwargs, history=[], sys_prompt="",
     result = ''
     while True:
         try: chunk = next(stream_response).decode()
-        except StopIteration: 
+        except StopIteration:
             break
         except requests.exceptions.ConnectionError:
             chunk = next(stream_response).decode() # 失败了，重试一次？再失败就没办法了。
         if len(chunk)==0: continue
-        if not chunk.startswith('data:'): 
+        if not chunk.startswith('data:'):
             error_msg = get_full_error(chunk.encode('utf8'), stream_response).decode()
             if "reduce the length" in error_msg:
                 raise ConnectionAbortedError("OpenAI拒绝了请求:" + error_msg)
@@ -90,14 +94,14 @@ def predict_no_ui_long_connection(inputs, llm_kwargs, history=[], sys_prompt="",
         delta = json_data["delta"]
         if len(delta) == 0: break
         if "role" in delta: continue
-        if "content" in delta: 
+        if "content" in delta:
             result += delta["content"]
             if not console_slience: print(delta["content"], end='')
-            if observe_window is not None: 
+            if observe_window is not None:
                 # 观测窗，把已经获取的数据显示出去
                 if len(observe_window) >= 1: observe_window[0] += delta["content"]
                 # 看门狗，如果超过期限没有喂狗，则终止
-                if len(observe_window) >= 2:  
+                if len(observe_window) >= 2:
                     if (time.time()-observe_window[1]) > watch_dog_patience:
                         raise RuntimeError("用户取消了程序。")
         else: raise RuntimeError("意外Json结构："+delta)
@@ -134,17 +138,24 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
         inputs = core_functional[additional_fn]["Prefix"] + inputs + core_functional[additional_fn]["Suffix"]
 
     raw_input = inputs
-    logging.info(f'[raw_input] {raw_input}')
+    # 更新cookies
+    username = chatbot.get_cookies().get("username")
+    if chatbot.get_cookies().pop("search", False):
+        raw_input = with_search_results(inputs)
+
+    conversation_id = chatbot.get_cookies().get("conversation_id")
+    # logging.info(f'[{username}] [raw_input] {raw_input}')
+    mongodb_history.add((username, conversation_id , "ask", raw_input))
     chatbot.append((inputs, ""))
     yield from update_ui(chatbot=chatbot, history=history, msg="等待响应") # 刷新界面
 
     try:
-        headers, payload = generate_payload(inputs, llm_kwargs, history, system_prompt, stream)
+        headers, payload = generate_payload(raw_input, llm_kwargs, history, system_prompt, stream)
     except RuntimeError as e:
         chatbot[-1] = (inputs, f"您提供的api-key不满足要求，不包含任何可用于{llm_kwargs['llm_model']}的api-key。您可能选择了错误的模型或请求源。")
         yield from update_ui(chatbot=chatbot, history=history, msg="api-key不满足要求") # 刷新界面
         return
-        
+
     history.append(inputs); history.append("")
 
     retry = 0
@@ -163,7 +174,7 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
             if retry > MAX_RETRY: raise TimeoutError
 
     gpt_replying_buffer = ""
-    
+
     is_head_of_the_stream = True
     if stream:
         stream_response =  response.iter_lines()
@@ -173,14 +184,16 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
             if is_head_of_the_stream and (r'"object":"error"' not in chunk.decode()):
                 # 数据流的第一帧不携带content
                 is_head_of_the_stream = False; continue
-            
+
             if chunk:
                 try:
                     chunk_decoded = chunk.decode()
                     # 前者API2D的
                     if ('data: [DONE]' in chunk_decoded) or (len(json.loads(chunk_decoded[6:])['choices'][0]["delta"]) == 0):
                         # 判定为数据流的结束，gpt_replying_buffer也写完了
-                        logging.info(f'[response] {gpt_replying_buffer}')
+                        # logging.info(f'[{username}] [response] {gpt_replying_buffer}')
+                        mongodb_history.add((username, conversation_id, "reply", gpt_replying_buffer))
+
                         break
                     # 处理数据流的主体
                     chunkjson = json.loads(chunk_decoded[6:])
@@ -199,7 +212,7 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
                     error_msg = chunk_decoded
                     if "reduce the length" in error_msg:
                         if len(history) >= 2: history[-1] = ""; history[-2] = "" # 清除当前溢出的输入：history[-2] 是本次输入, history[-1] 是本次输出
-                        history = clip_history(inputs=inputs, history=history, tokenizer=model_info[llm_kwargs['llm_model']]['tokenizer'], 
+                        history = clip_history(inputs=inputs, history=history, tokenizer=model_info[llm_kwargs['llm_model']]['tokenizer'],
                                                max_token_limit=(model_info[llm_kwargs['llm_model']]['max_token'])) # history至少释放二分之一
                         chatbot[-1] = (chatbot[-1][0], "[Local Message] Reduce the length. 本次输入过长, 或历史数据过长. 历史缓存数据已部分释放, 您可以请再次尝试. (若再次失败则更可能是因为输入过长.)")
                         # history = []    # 清除历史
@@ -260,7 +273,7 @@ def generate_payload(inputs, llm_kwargs, history, system_prompt, stream):
 
     payload = {
         "model": llm_kwargs['llm_model'].strip('api2d-'),
-        "messages": messages, 
+        "messages": messages,
         "temperature": llm_kwargs['temperature'],  # 1.0,
         "top_p": llm_kwargs['top_p'],  # 1.0,
         "n": 1,

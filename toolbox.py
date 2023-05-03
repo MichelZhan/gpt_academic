@@ -1,3 +1,4 @@
+import uuid
 import markdown
 import importlib
 import traceback
@@ -6,6 +7,8 @@ import re
 import os
 from latex2mathml.converter import convert as tex2mathml
 from functools import wraps, lru_cache
+from duckduckgo_search import ddg
+from datetime import datetime
 
 """
 ========================================================================
@@ -35,18 +38,50 @@ class ChatBotWithCookies(list):
         return self._cookies
 
 
+def add_source_numbers(lst, source_name = "Source", use_source = True):
+    if use_source:
+        return [f'[{idx+1}]\t "{item[0]}"\n{source_name}: {item[1]}' for idx, item in enumerate(lst)]
+    else:
+        return [f'[{idx+1}]\t "{item}"' for idx, item in enumerate(lst)]
+
+
+def with_search_results(inputs: str):
+    search_results = ddg(inputs, max_results=5)
+    reference_results = []
+    for idx, result in enumerate(search_results):
+        reference_results.append([result["body"], result["href"]])
+
+    return """\
+Web search results:
+
+{web_results}
+Current date: {current_date}
+
+Instructions: Using the provided web search results, write a comprehensive reply to the given query. Make sure to cite results using [[number](URL)] notation after the reference. If the provided search results refer to multiple subjects with the same name, write separate answers for each subject.
+Query: {query}
+""".replace("{current_date}", datetime.today().strftime("%Y-%m-%d"))\
+        .replace("{query}", inputs.replace("??", "", 1))\
+        .replace("{web_results}", "\n\n".join(add_source_numbers(reference_results)))
+
 def ArgsGeneralWrapper(f):
     """
     装饰器函数，用于重组输入参数，改变输入参数的顺序与结构。
     """
-    def decorated(cookies, max_length, llm_model, txt, txt2, top_p, temperature, chatbot, history, system_prompt, plugin_advanced_arg, *args):
+    import gradio
+    def decorated(cookies, max_length, llm_model, txt, txt2, top_p, temperature, chatbot, history, system_prompt, plugin_advanced_arg, request: gradio.Request, *args):
         txt_passon = txt
         if txt == "" and txt2 != "": txt_passon = txt2
         # 引入一个有cookie的chatbot
         cookies.update({
             'top_p':top_p,
             'temperature':temperature,
+            'username': request.username,
+            'search': txt.startswith("??"),
         })
+        if not history:
+            cookies.update({
+                'conversation_id': uuid.uuid4().hex
+            })
         llm_kwargs = {
             'api_key': cookies['api_key'],
             'llm_model': llm_model,
@@ -228,7 +263,7 @@ def markdown_convertion(txt):
     if txt.startswith(pre) and txt.endswith(suf):
         # print('警告，输入了已经经过转化的字符串，二次转化可能出问题')
         return txt # 已经被转化过，不需要再次转化
-    
+
     markdown_extension_configs = {
         'mdx_math': {
             'enable_dollar_delimiter': True,
@@ -273,7 +308,7 @@ def markdown_convertion(txt):
         return content
 
     def no_code(txt):
-        if '```' not in txt: 
+        if '```' not in txt:
             return True
         else:
             if '```reference' in txt: return True    # newbing
@@ -490,11 +525,11 @@ def what_keys(keys):
     key_list = keys.split(',')
 
     for k in key_list:
-        if is_openai_api_key(k): 
+        if is_openai_api_key(k):
             avail_key_list['OpenAI Key'] += 1
 
     for k in key_list:
-        if is_api2d_key(k): 
+        if is_api2d_key(k):
             avail_key_list['API2D Key'] += 1
 
     return f"检测到： OpenAI Key {avail_key_list['OpenAI Key']} 个，API2D Key {avail_key_list['API2D Key']} 个"
@@ -535,10 +570,10 @@ def read_env_variable(arg, default_value):
         set GPT_ACADEMIC_AUTHENTICATION=[("username", "password"), ("username2", "password2")]
     """
     from colorful import print亮红, print亮绿
-    arg_with_prefix = "GPT_ACADEMIC_" + arg 
-    if arg_with_prefix in os.environ: 
+    arg_with_prefix = "GPT_ACADEMIC_" + arg
+    if arg_with_prefix in os.environ:
         env_arg = os.environ[arg_with_prefix]
-    elif arg in os.environ: 
+    elif arg in os.environ:
         env_arg = os.environ[arg]
     else:
         raise KeyError
@@ -575,7 +610,7 @@ def read_single_conf_with_lru_cache(arg):
     try:
         # 优先级1. 获取环境变量作为配置
         default_ref = getattr(importlib.import_module('config'), arg)   # 读取默认值作为数据类型转换的参考
-        r = read_env_variable(arg, default_ref) 
+        r = read_env_variable(arg, default_ref)
     except:
         try:
             # 优先级2. 获取config_private中的配置
@@ -662,7 +697,7 @@ def run_gradio_in_subpath(demo, auth, port, custom_path):
     app = FastAPI()
     if custom_path != "/":
         @app.get("/")
-        def read_main(): 
+        def read_main():
             return {"message": f"Gradio is running at: {custom_path}"}
     app = gr.mount_gradio_app(app, demo, path=custom_path)
     uvicorn.run(app, host="0.0.0.0", port=port) # , auth=auth
@@ -673,13 +708,13 @@ def clip_history(inputs, history, tokenizer, max_token_limit):
     reduce the length of history by clipping.
     this function search for the longest entries to clip, little by little,
     until the number of token of history is reduced under threshold.
-    通过裁剪来缩短历史记录的长度。 
+    通过裁剪来缩短历史记录的长度。
     此函数逐渐地搜索最长的条目进行剪辑，
     直到历史记录的标记数量降低到阈值以下。
     """
     import numpy as np
     from request_llm.bridge_all import model_info
-    def get_token_num(txt): 
+    def get_token_num(txt):
         return len(tokenizer.encode(txt, disallowed_special=()))
     input_token_num = get_token_num(inputs)
     if input_token_num < max_token_limit * 3 / 4:
